@@ -351,6 +351,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         use_paged_kv: bool = False,
         num_tokens_per_page: int | None = None,
         balanced_scheduler: bool = False,
+        paged_kv_layout: str = "HND",
     ) -> None:
         """Initialize the FMHA prefill kernel configuration.
 
@@ -362,10 +363,14 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param kv_tile: Key/Value sequence tile size.
         :param use_paged_kv: Whether K/V are read from paged KV pools.
         :param num_tokens_per_page: Tokens per physical K/V page.
+        :param paged_kv_layout: Physical axis order of the logical HND pool view.
         :param balanced_scheduler: Use the causal load-balanced grid mapping
             and visit Q tiles in reverse order. Compilation must guarantee
             that causal masking is enabled when this option is true.
         """
+        if paged_kv_layout not in ("HND", "NHD"):
+            raise ValueError("paged_kv_layout must be HND or NHD")
+        self.paged_kv_layout = paged_kv_layout
         # Data types
         if in_dtype != cutlass.Float8E4M3FN:
             raise ValueError("in_dtype must be Float8E4M3FN")
@@ -719,8 +724,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         tma_desc_ptr,
                         (
                             head_offset,
-                            token_in_page,
-                            kv_head_idx,
+                            kv_head_idx
+                            if cutlass.const_expr(self.paged_kv_layout == "NHD")
+                            else token_in_page,
+                            token_in_page
+                            if cutlass.const_expr(self.paged_kv_layout == "NHD")
+                            else kv_head_idx,
                             page_id,
                         ),
                         mbar_arrived,
@@ -2210,6 +2219,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         cu_seqlens_q: cute.Tensor | None = None,
         block_tables: cute.Tensor | None = None,
         cu_seqlens_k: cute.Tensor | None = None,
+        output_gate: cute.Tensor | None = None,
     ) -> None:
         """SM120 FMHA prefill FP8 kernel.
 
@@ -2917,6 +2927,33 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     + store_col_in_cta
                 )
                 if store_q_seq_idx < seqlen_q and store_col_in_cta < head_dim:
+                    if cutlass.const_expr(output_gate is not None):
+                        gate_ptr = (
+                            output_gate.iterator.raw_ptr()
+                            + (q_token_base + store_q_seq_idx) * output_gate.stride[0]
+                            + q_head_idx * output_gate.stride[1]
+                            + store_col_in_cta
+                        )
+                        gate_vec = gate_ptr.load(count=8, alignment=16)
+                        o_vec = cutlass.Vector.from_elements(
+                            tuple(
+                                self.out_dtype(
+                                    cutlass.Float32(o_vec[i])
+                                    * cute.math.rcp(
+                                        1.0
+                                        + cute.math.exp2(
+                                            -cutlass.Float32(gate_vec[i])
+                                            * 1.4426950408889634,
+                                            fastmath=True,
+                                        ),
+                                        approx=True,
+                                        ftz=True,
+                                    )
+                                )
+                                for i in range(8)
+                            ),
+                            dtype=self.out_dtype,
+                        )
                     gO_ptr.store(o_vec, alignment=16)
 
         # A zero-length K/V sequence has a mathematically empty attention
@@ -2976,6 +3013,45 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         max_seqlen_q: cutlass.Int32 | None = None,
         use_pdl: bool = False,
     ) -> None:
+        self._launch(
+            q,
+            k,
+            v,
+            o,
+            lse,
+            softmax_scale_log2,
+            output_scale,
+            skip_softmax_threshold,
+            stream,
+            seqlens_kv,
+            cu_seqlens_q,
+            block_tables,
+            cu_seqlens_k,
+            max_seqlen_q,
+            use_pdl,
+            None,
+        )
+
+    @cute.jit
+    def _launch(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        o: cute.Tensor,
+        lse: cute.Tensor | None,
+        softmax_scale_log2: cutlass.Float32,
+        output_scale: cutlass.Float32,
+        skip_softmax_threshold: cute.Tensor | None,
+        stream: cuda_driver.CUstream,
+        seqlens_kv: cute.Tensor | None = None,
+        cu_seqlens_q: cute.Tensor | None = None,
+        block_tables: cute.Tensor | None = None,
+        cu_seqlens_k: cute.Tensor | None = None,
+        max_seqlen_q: cutlass.Int32 | None = None,
+        use_pdl: bool = False,
+        output_gate: cute.Tensor | None = None,
+    ) -> None:
         """Launch the SM120 PRIM FMHA FP8 kernel.
 
         :param q: Packed query ``(total_q, Hq, D)``.
@@ -2999,6 +3075,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param cu_seqlens_k: Packed-K/V cumulative Int32 offsets.
         :param max_seqlen_q: Contiguous-varlen launch-grid bound.
         :param use_pdl: Whether to use Programmatic Dependent Launch.
+        :param output_gate: Optional strided output-shaped sigmoid gate.
 
         Direct callers must satisfy the same shape contract enforced by
         :meth:`can_implement_paged`.
@@ -3027,7 +3104,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     self.num_tokens_per_page,
                     self.tma_copy_head_per_iter,
                 ),
-                stride_order=(3, 2, 1, 0),
+                stride_order=(3, 1, 2, 0)
+                if self.paged_kv_layout == "NHD"
+                else (3, 2, 1, 0),
                 swizzle=self.tma_swizzle,
             )
             tma_v_desc = cuda.create_tensor_map_tiled_from_view(
@@ -3038,7 +3117,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     self.num_tokens_per_page,
                     self.tma_copy_head_per_iter,
                 ),
-                stride_order=(3, 2, 1, 0),
+                stride_order=(3, 1, 2, 0)
+                if self.paged_kv_layout == "NHD"
+                else (3, 2, 1, 0),
                 swizzle=self.tma_swizzle,
             )
         else:
@@ -3094,6 +3175,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             cu_seqlens_q,
             block_tables,
             cu_seqlens_k,
+            output_gate,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
