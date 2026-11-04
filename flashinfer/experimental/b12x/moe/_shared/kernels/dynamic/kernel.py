@@ -4231,7 +4231,9 @@ class MoEDynamicKernelBackend:
         tCrSFB = self._dense_cls._partition_fragment_SFB(
             self, sSFB[None, None, 0], thr_mma, tidx
         )
-        if cutlass.const_expr(self.direct_sfb):
+        # The dense partition already separates N and K for the four-N-warp
+        # NVFP4 fragment; flatten only a fragment it left nested.
+        if cutlass.const_expr(self.direct_sfb and cute.rank(tCrSFB) == 2):
             tCrSFB = cute.make_tensor(
                 tCrSFB.iterator,
                 cute.make_layout(
